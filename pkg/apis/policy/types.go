@@ -66,7 +66,29 @@ type PodDisruptionBudgetSpec struct {
 	// if they encounter an unrecognized policy in this field.
 	// +optional
 	UnhealthyPodEvictionPolicy *UnhealthyPodEvictionPolicyType
+
+	// AvailabilityMode indicates whether availability should be calculated based on
+	// individual pods (PodAvailabilityMode) or pod groups defined by the Workload API (WorkloadAvailabilityMode).
+	// If set to WorkloadAvailabilityMode, the eviction logic will interpret minAvailable/maxUnavailable
+	// as a count of PodGroup replicas, not individual pods.
+	// If a pod matched by the selector does not have a workloadReference,
+	// it will be treated as an individual pod for availability calculations,
+	// and a warning will be logged.
+	// Defaults to PodAvailabilityMode.
+	// +optional
+	AvailabilityMode *AvailabilityMode
 }
+
+// AvailabilityMode is a string that specifies how to calculate availability.
+// +enum
+type AvailabilityMode string
+
+const (
+	// PodAvailability indicates that availability should be calculated based on individual pods.
+	PodAvailability AvailabilityMode = "Pod"
+	// WorkloadAvailability indicates that availability should be calculated based on pod groups defined by the Workload API.
+	WorkloadAvailability AvailabilityMode = "Workload"
+)
 
 // UnhealthyPodEvictionPolicyType defines the criteria for when unhealthy pods
 // should be considered for eviction.

@@ -68,6 +68,15 @@ type PodDisruptionBudgetSpecApplyConfiguration struct {
 	// Clients making eviction decisions should disallow eviction of unhealthy pods
 	// if they encounter an unrecognized policy in this field.
 	UnhealthyPodEvictionPolicy *policyv1beta1.UnhealthyPodEvictionPolicyType `json:"unhealthyPodEvictionPolicy,omitempty"`
+	// AvailabilityMode indicates whether availability should be calculated based on
+	// individual pods (PodAvailabilityMode) or pod groups defined by the Workload API (WorkloadAvailabilityMode).
+	// If set to WorkloadAvailabilityMode, the eviction logic will interpret minAvailable/maxUnavailable
+	// as a count of PodGroup replicas, not individual pods.
+	// If a pod matched by the selector does not have a workloadReference,
+	// it will be treated as an individual pod for availability calculations,
+	// and a warning will be logged.
+	// Defaults to PodAvailabilityMode.
+	AvailabilityMode *policyv1beta1.AvailabilityMode `json:"availabilityMode,omitempty"`
 }
 
 // PodDisruptionBudgetSpecApplyConfiguration constructs a declarative configuration of the PodDisruptionBudgetSpec type for use with
@@ -105,5 +114,13 @@ func (b *PodDisruptionBudgetSpecApplyConfiguration) WithMaxUnavailable(value int
 // If called multiple times, the UnhealthyPodEvictionPolicy field is set to the value of the last call.
 func (b *PodDisruptionBudgetSpecApplyConfiguration) WithUnhealthyPodEvictionPolicy(value policyv1beta1.UnhealthyPodEvictionPolicyType) *PodDisruptionBudgetSpecApplyConfiguration {
 	b.UnhealthyPodEvictionPolicy = &value
+	return b
+}
+
+// WithAvailabilityMode sets the AvailabilityMode field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the AvailabilityMode field is set to the value of the last call.
+func (b *PodDisruptionBudgetSpecApplyConfiguration) WithAvailabilityMode(value policyv1beta1.AvailabilityMode) *PodDisruptionBudgetSpecApplyConfiguration {
+	b.AvailabilityMode = &value
 	return b
 }

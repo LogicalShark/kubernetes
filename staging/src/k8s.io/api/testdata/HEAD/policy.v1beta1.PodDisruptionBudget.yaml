@@ -33,6 +33,7 @@ metadata:
   selfLink: selfLinkValue
   uid: uidValue
 spec:
+  availabilityMode: availabilityModeValue
   maxUnavailable: maxUnavailableValue
   minAvailable: minAvailableValue
   selector:

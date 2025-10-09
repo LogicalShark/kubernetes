@@ -209,6 +209,13 @@ func (m *PodDisruptionBudgetSpec) MarshalToSizedBuffer(dAtA []byte) (int, error)
 	_ = i
 	var l int
 	_ = l
+	if m.AvailabilityMode != nil {
+		i -= len(*m.AvailabilityMode)
+		copy(dAtA[i:], *m.AvailabilityMode)
+		i = encodeVarintGenerated(dAtA, i, uint64(len(*m.AvailabilityMode)))
+		i--
+		dAtA[i] = 0x2a
+	}
 	if m.UnhealthyPodEvictionPolicy != nil {
 		i -= len(*m.UnhealthyPodEvictionPolicy)
 		copy(dAtA[i:], *m.UnhealthyPodEvictionPolicy)
@@ -416,6 +423,10 @@ func (m *PodDisruptionBudgetSpec) Size() (n int) {
 		l = len(*m.UnhealthyPodEvictionPolicy)
 		n += 1 + l + sovGenerated(uint64(l))
 	}
+	if m.AvailabilityMode != nil {
+		l = len(*m.AvailabilityMode)
+		n += 1 + l + sovGenerated(uint64(l))
+	}
 	return n
 }
 
@@ -502,6 +513,7 @@ func (this *PodDisruptionBudgetSpec) String() string {
 		`Selector:` + strings.Replace(fmt.Sprintf("%v", this.Selector), "LabelSelector", "v1.LabelSelector", 1) + `,`,
 		`MaxUnavailable:` + strings.Replace(fmt.Sprintf("%v", this.MaxUnavailable), "IntOrString", "intstr.IntOrString", 1) + `,`,
 		`UnhealthyPodEvictionPolicy:` + valueToStringGenerated(this.UnhealthyPodEvictionPolicy) + `,`,
+		`AvailabilityMode:` + valueToStringGenerated(this.AvailabilityMode) + `,`,
 		`}`,
 	}, "")
 	return s
@@ -1099,6 +1111,39 @@ func (m *PodDisruptionBudgetSpec) Unmarshal(dAtA []byte) error {
 			}
 			s := UnhealthyPodEvictionPolicyType(dAtA[iNdEx:postIndex])
 			m.UnhealthyPodEvictionPolicy = &s
+			iNdEx = postIndex
+		case 5:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field AvailabilityMode", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowGenerated
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthGenerated
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthGenerated
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			s := AvailabilityMode(dAtA[iNdEx:postIndex])
+			m.AvailabilityMode = &s
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex

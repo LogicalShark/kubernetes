@@ -45699,6 +45699,14 @@ func schema_k8sio_api_policy_v1_PodDisruptionBudgetSpec(ref common.ReferenceCall
 							Enum:        []interface{}{"AlwaysAllow", "IfHealthyBudget"},
 						},
 					},
+					"availabilityMode": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AvailabilityMode indicates whether availability should be calculated based on individual pods (PodAvailabilityMode) or pod groups defined by the Workload API (WorkloadAvailabilityMode). If set to WorkloadAvailabilityMode, the eviction logic will interpret minAvailable/maxUnavailable as a count of PodGroup replicas, not individual pods. If a pod matched by the selector does not have a workloadReference, it will be treated as an individual pod for availability calculations, and a warning will be logged. Defaults to PodAvailabilityMode.\n\nPossible enum values:\n - `\"Pod\"` indicates that availability should be calculated based on individual pods.\n - `\"Workload\"` indicates that availability should be calculated based on pod groups defined by the Workload API.",
+							Type:        []string{"string"},
+							Format:      "",
+							Enum:        []interface{}{"Pod", "Workload"},
+						},
+					},
 				},
 			},
 		},
@@ -45974,6 +45982,14 @@ func schema_k8sio_api_policy_v1beta1_PodDisruptionBudgetSpec(ref common.Referenc
 							Type:        []string{"string"},
 							Format:      "",
 							Enum:        []interface{}{"AlwaysAllow", "IfHealthyBudget"},
+						},
+					},
+					"availabilityMode": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AvailabilityMode indicates whether availability should be calculated based on individual pods (PodAvailabilityMode) or pod groups defined by the Workload API (WorkloadAvailabilityMode). If set to WorkloadAvailabilityMode, the eviction logic will interpret minAvailable/maxUnavailable as a count of PodGroup replicas, not individual pods. If a pod matched by the selector does not have a workloadReference, it will be treated as an individual pod for availability calculations, and a warning will be logged. Defaults to PodAvailabilityMode.\n\nPossible enum values:\n - `\"Pod\"` indicates that availability should be calculated based on individual pods.\n - `\"Workload\"` indicates that availability should be calculated based on pod groups defined by the Workload API.",
+							Type:        []string{"string"},
+							Format:      "",
+							Enum:        []interface{}{"Pod", "Workload"},
 						},
 					},
 				},

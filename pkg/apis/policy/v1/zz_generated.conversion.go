@@ -188,6 +188,7 @@ func autoConvert_v1_PodDisruptionBudgetSpec_To_policy_PodDisruptionBudgetSpec(in
 	out.Selector = (*metav1.LabelSelector)(unsafe.Pointer(in.Selector))
 	out.MaxUnavailable = (*intstr.IntOrString)(unsafe.Pointer(in.MaxUnavailable))
 	out.UnhealthyPodEvictionPolicy = (*policy.UnhealthyPodEvictionPolicyType)(unsafe.Pointer(in.UnhealthyPodEvictionPolicy))
+	out.AvailabilityMode = (*policy.AvailabilityMode)(unsafe.Pointer(in.AvailabilityMode))
 	return nil
 }
 
@@ -201,6 +202,7 @@ func autoConvert_policy_PodDisruptionBudgetSpec_To_v1_PodDisruptionBudgetSpec(in
 	out.Selector = (*metav1.LabelSelector)(unsafe.Pointer(in.Selector))
 	out.MaxUnavailable = (*intstr.IntOrString)(unsafe.Pointer(in.MaxUnavailable))
 	out.UnhealthyPodEvictionPolicy = (*policyv1.UnhealthyPodEvictionPolicyType)(unsafe.Pointer(in.UnhealthyPodEvictionPolicy))
+	out.AvailabilityMode = (*policyv1.AvailabilityMode)(unsafe.Pointer(in.AvailabilityMode))
 	return nil
 }
 

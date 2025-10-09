@@ -26,6 +26,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/api/extensions/v1beta1"
 	policy "k8s.io/api/policy/v1"
+	"k8s.io/api/scheduling/v1alpha1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -39,12 +40,14 @@ import (
 	appsv1informers "k8s.io/client-go/informers/apps/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	policyinformers "k8s.io/client-go/informers/policy/v1"
+	schedulingv1alpha1informers "k8s.io/client-go/informers/scheduling/v1alpha1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	policylisters "k8s.io/client-go/listers/policy/v1"
+	schedulingv1alpha1listers "k8s.io/client-go/listers/scheduling/v1alpha1"
 	scaleclient "k8s.io/client-go/scale"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
@@ -103,6 +106,9 @@ type DisruptionController struct {
 	ssLister       appsv1listers.StatefulSetLister
 	ssListerSynced cache.InformerSynced
 
+	workloadLister       schedulingv1alpha1listers.WorkloadLister
+	workloadListerSynced cache.InformerSynced
+
 	// PodDisruptionBudget keys that need to be synced.
 	queue        workqueue.TypedRateLimitingInterface[string]
 	recheckQueue workqueue.TypedDelayingInterface[string]
@@ -138,6 +144,7 @@ func NewDisruptionController(
 	rsInformer appsv1informers.ReplicaSetInformer,
 	dInformer appsv1informers.DeploymentInformer,
 	ssInformer appsv1informers.StatefulSetInformer,
+	workloadInformer schedulingv1alpha1informers.WorkloadInformer,
 	kubeClient clientset.Interface,
 	restMapper apimeta.RESTMapper,
 	scaleNamespacer scaleclient.ScalesGetter,
@@ -151,6 +158,7 @@ func NewDisruptionController(
 		rsInformer,
 		dInformer,
 		ssInformer,
+		workloadInformer,
 		kubeClient,
 		restMapper,
 		scaleNamespacer,
@@ -169,6 +177,7 @@ func NewDisruptionControllerInternal(ctx context.Context,
 	rsInformer appsv1informers.ReplicaSetInformer,
 	dInformer appsv1informers.DeploymentInformer,
 	ssInformer appsv1informers.StatefulSetInformer,
+	workloadInformer schedulingv1alpha1informers.WorkloadInformer,
 	kubeClient clientset.Interface,
 	restMapper apimeta.RESTMapper,
 	scaleNamespacer scaleclient.ScalesGetter,
@@ -250,6 +259,9 @@ func NewDisruptionControllerInternal(ctx context.Context,
 
 	dc.ssLister = ssInformer.Lister()
 	dc.ssListerSynced = ssInformer.Informer().HasSynced
+
+	dc.workloadLister = workloadInformer.Lister()
+	dc.workloadListerSynced = workloadInformer.Informer().HasSynced
 
 	dc.mapper = restMapper
 	dc.scaleNamespacer = scaleNamespacer
@@ -473,7 +485,7 @@ func (dc *DisruptionController) Run(ctx context.Context) {
 		wg.Wait()
 	}()
 
-	if !cache.WaitForNamedCacheSyncWithContext(ctx, dc.podListerSynced, dc.pdbListerSynced, dc.rcListerSynced, dc.rsListerSynced, dc.dListerSynced, dc.ssListerSynced) {
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, dc.podListerSynced, dc.pdbListerSynced, dc.rcListerSynced, dc.rsListerSynced, dc.dListerSynced, dc.ssListerSynced, dc.workloadListerSynced) {
 		return
 	}
 
@@ -743,7 +755,17 @@ func (dc *DisruptionController) trySync(ctx context.Context, pdb *policy.PodDisr
 		dc.recorder.Eventf(pdb, v1.EventTypeNormal, "NoPods", "No matching pods found")
 	}
 
-	expectedCount, desiredHealthy, unmanagedPods, err := dc.getExpectedPodCount(ctx, pdb, pods)
+	var workloadCache map[string]*v1alpha1.Workload
+	var podGroupCache map[string]v1alpha1.PodGroup
+	if pdb.Spec.AvailabilityMode != nil && *pdb.Spec.AvailabilityMode == policy.WorkloadAvailability {
+		workloadCache, podGroupCache, err = dc.getWorkloadAndPodGroups(pdb, pods)
+		if err != nil {
+			dc.recorder.Eventf(pdb, v1.EventTypeWarning, "GetWorkloadsFailed", "Failed to get workloads for pods: %v", err)
+			return err
+		}
+	}
+
+	expectedCount, desiredHealthy, unmanagedPods, err := dc.getExpectedCounts(ctx, pdb, pods, workloadCache)
 	if err != nil {
 		dc.recorder.Eventf(pdb, v1.EventTypeWarning, "CalculateExpectedPodCountFailed", "Failed to calculate the number of expected pods: %v", err)
 		return err
@@ -759,7 +781,7 @@ func (dc *DisruptionController) trySync(ctx context.Context, pdb *policy.PodDisr
 
 	currentTime := dc.clock.Now()
 	disruptedPods, recheckTime := dc.buildDisruptedPodMap(logger, pods, pdb, currentTime)
-	currentHealthy := countHealthyPods(pods, disruptedPods, currentTime)
+	currentHealthy := dc.countHealthyReplicas(pdb, pods, disruptedPods, currentTime, workloadCache, podGroupCache)
 	err = dc.updatePdbStatus(ctx, pdb, currentHealthy, desiredHealthy, expectedCount, disruptedPods)
 
 	if err == nil && recheckTime != nil {
@@ -815,18 +837,50 @@ func (dc *DisruptionController) syncStalePodDisruption(ctx context.Context, key 
 	return nil
 }
 
-func (dc *DisruptionController) getExpectedPodCount(ctx context.Context, pdb *policy.PodDisruptionBudget, pods []*v1.Pod) (expectedCount, desiredHealthy int32, unmanagedPods []string, err error) {
-	err = nil
-	// TODO(davidopp): consider making the way expectedCount and rules about
-	// permitted controller configurations (specifically, considering it an error
-	// if a pod covered by a PDB has 0 controllers or > 1 controller) should be
-	// handled the same way for integer and percentage minAvailable
+func (dc *DisruptionController) getWorkloadAndPodGroups(pdb *policy.PodDisruptionBudget, pods []*v1.Pod) (map[string]*v1alpha1.Workload, map[string]v1alpha1.PodGroup, error) {
+	workloadCache := make(map[string]*v1alpha1.Workload)
+	podGroupCache := make(map[string]v1alpha1.PodGroup)
 
-	if pdb.Spec.MaxUnavailable != nil {
-		expectedCount, unmanagedPods, err = dc.getExpectedScale(ctx, pods)
-		if err != nil {
-			return
+	workloadNames := make(map[string]struct{})
+	for _, pod := range pods {
+		if pod.Spec.WorkloadRef != nil && pod.Spec.WorkloadRef.Name != "" {
+			workloadNames[pod.Spec.WorkloadRef.Name] = struct{}{}
 		}
+	}
+
+	for workloadName := range workloadNames {
+		workload, err := dc.workloadLister.Workloads(pdb.Namespace).Get(workloadName)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return nil, nil, err
+		}
+		workloadCache[workloadName] = workload
+		for _, podGroup := range workload.Spec.PodGroups {
+			if podGroup.Name != "" {
+				podGroupCache[podGroup.Name] = podGroup
+			}
+		}
+	}
+	return workloadCache, podGroupCache, nil
+}
+
+func (dc *DisruptionController) getExpectedCounts(ctx context.Context, pdb *policy.PodDisruptionBudget, pods []*v1.Pod, workloadCache map[string]*v1alpha1.Workload) (expectedCount, desiredHealthy int32, unmanagedPods []string, err error) {
+	if pdb.Spec.AvailabilityMode != nil && *pdb.Spec.AvailabilityMode == policy.WorkloadAvailability {
+		expectedCount, err = dc.getExpectedPodGroupCount(pods, workloadCache)
+		if err != nil {
+			return 0, 0, nil, err
+		}
+	} else {
+		expectedCount, unmanagedPods, err = dc.getExpectedPod(ctx, pdb, pods)
+		if err != nil {
+			return 0, 0, nil, err
+		}
+	}
+
+	// Calculate desiredHealthy.
+	if pdb.Spec.MaxUnavailable != nil {
 		var maxUnavailable int
 		maxUnavailable, err = intstr.GetScaledValueFromIntOrPercent(pdb.Spec.MaxUnavailable, int(expectedCount), true)
 		if err != nil {
@@ -839,13 +893,7 @@ func (dc *DisruptionController) getExpectedPodCount(ctx context.Context, pdb *po
 	} else if pdb.Spec.MinAvailable != nil {
 		if pdb.Spec.MinAvailable.Type == intstr.Int {
 			desiredHealthy = pdb.Spec.MinAvailable.IntVal
-			expectedCount = int32(len(pods))
 		} else if pdb.Spec.MinAvailable.Type == intstr.String {
-			expectedCount, unmanagedPods, err = dc.getExpectedScale(ctx, pods)
-			if err != nil {
-				return
-			}
-
 			var minAvailable int
 			minAvailable, err = intstr.GetScaledValueFromIntOrPercent(pdb.Spec.MinAvailable, int(expectedCount), true)
 			if err != nil {
@@ -857,7 +905,47 @@ func (dc *DisruptionController) getExpectedPodCount(ctx context.Context, pdb *po
 	return
 }
 
-func (dc *DisruptionController) getExpectedScale(ctx context.Context, pods []*v1.Pod) (expectedCount int32, unmanagedPods []string, err error) {
+func (dc *DisruptionController) getExpectedPodGroupCount(pods []*v1.Pod, workloadCache map[string]*v1alpha1.Workload) (expectedCount int32, err error) {
+	// Instead of pods, count multi-pod replicas as defined by Workload
+	workloads := make(map[string]struct{})
+	for _, pod := range pods {
+		if pod.Spec.WorkloadRef != nil {
+			workloads[pod.Spec.WorkloadRef.Name] = struct{}{}
+		}
+	}
+
+	expectedCount = 0
+	for workloadName := range workloads {
+		workload, ok := workloadCache[workloadName]
+		if !ok {
+			// This can happen if the workload is deleted after we get the pods.
+			// We can just ignore it.
+			continue
+		}
+		expectedCount += int32(len(workload.Spec.PodGroups))
+	}
+	return expectedCount, nil
+}
+
+func (dc *DisruptionController) getExpectedPod(ctx context.Context, pdb *policy.PodDisruptionBudget, pods []*v1.Pod) (expectedCount int32, unmanagedPods []string, err error) {
+	// TODO(davidopp): consider making the way expectedCount and rules about
+	// permitted controller configurations (specifically, considering it an error
+	// if a pod covered by a PDB has 0 controllers or > 1 controller) should be
+	// handled the same way for integer and percentage minAvailable
+
+	// Default behavior, count pods
+	if (pdb.Spec.MinAvailable != nil && pdb.Spec.MinAvailable.Type == intstr.String) || pdb.Spec.MaxUnavailable != nil {
+		expectedCount, unmanagedPods, err = dc.getExpectedScale(ctx, pdb, pods)
+		if err != nil {
+			return
+		}
+	} else {
+		expectedCount = int32(len(pods))
+	}
+	return
+}
+
+func (dc *DisruptionController) getExpectedScale(ctx context.Context, pdb *policy.PodDisruptionBudget, pods []*v1.Pod) (expectedCount int32, unmanagedPods []string, err error) {
 	// When the user specifies a fraction of pods that must be available, we
 	// use as the fraction's denominator
 	// SUM_{all c in C} scale(c)
@@ -873,17 +961,10 @@ func (dc *DisruptionController) getExpectedScale(ctx context.Context, pods []*v1
 	controllerScale := map[types.UID]int32{}
 
 	// 1. Find the controller for each pod.
-
-	// As of now, we allow PDBs to be applied to pods via selectors, so there
-	// can be unmanaged pods(pods that don't have backing controllers) but still have PDBs associated.
-	// Such pods are to be collected and PDB backing them should be enqueued instead of immediately throwing
-	// a sync error. This ensures disruption controller is not frequently updating the status subresource and thus
-	// preventing excessive and expensive writes to etcd.
-	// With ControllerRef, a pod can only have 1 controller.
 	for _, pod := range pods {
 		controllerRef := metav1.GetControllerOf(pod)
 		if controllerRef == nil {
-			unmanagedPods = append(unmanagedPods, pod.Name)
+			// We're not considering unmanaged pods because they don't have a scale.
 			continue
 		}
 
@@ -913,30 +994,107 @@ func (dc *DisruptionController) getExpectedScale(ctx context.Context, pods []*v1
 	}
 
 	// 2. Add up all the controllers.
-	expectedCount = 0
 	for _, count := range controllerScale {
 		expectedCount += count
+	}
+
+	// As of now, we allow PDBs to be applied to pods via selectors, so there
+	// can be unmanaged pods(pods that don't have backing controllers) but still have PDBs associated.
+	// Such pods are to be collected and PDB backing them should be enqueued instead of immediately throwing
+	// a sync error. This ensures disruption controller is not frequently updating the status subresource and thus
+	// preventing excessive and expensive writes to etcd.
+	// With ControllerRef, a pod can only have 1 controller.
+	for _, pod := range pods {
+		controllerRef := metav1.GetControllerOf(pod)
+		if controllerRef == nil {
+			unmanagedPods = append(unmanagedPods, pod.Name)
+		}
 	}
 
 	return
 }
 
+func (dc *DisruptionController) countHealthyReplicas(pdb *policy.PodDisruptionBudget, pods []*v1.Pod, disruptedPods map[string]metav1.Time, currentTime time.Time, workloadCache map[string]*v1alpha1.Workload, podGroupCache map[string]v1alpha1.PodGroup) int32 {
+	if pdb.Spec.AvailabilityMode == nil && *pdb.Spec.AvailabilityMode == policy.WorkloadAvailability {
+		return dc.countHealthyPodGroups(pods, disruptedPods, currentTime, workloadCache, podGroupCache)
+	}
+	return countHealthyPods(pods, disruptedPods, currentTime)
+}
+
+func (dc *DisruptionController) countHealthyPodGroups(pods []*v1.Pod, disruptedPods map[string]metav1.Time, currentTime time.Time, workloadCache map[string]*v1alpha1.Workload, podGroupCache map[string]v1alpha1.PodGroup) (currentHealthy int32) {
+	// Count of healthy pods per group
+	podGroupHealthyPods := make(map[string]int32)
+	for _, pod := range pods {
+		if pod.Spec.WorkloadRef == nil || pod.Spec.WorkloadRef.Name == "" || pod.Spec.WorkloadRef.PodGroup == "" {
+			// Pod is not part of a workload
+			// TODO: determine proper way to log
+			klog.Warningf("Including individual pods in a PodDisruptionBudget for Workload pods (`usePodGroups: true`) is not recommended. Individual pods will be counted as pod groups of size 1.")
+			if isPodHealthy(pod, disruptedPods, currentTime) {
+				currentHealthy++
+			}
+			continue
+		}
+		workloadName := pod.Spec.WorkloadRef.Name
+		podGroupName := pod.Spec.WorkloadRef.PodGroup
+
+		// Get the workload
+		if _, ok := workloadCache[workloadName]; !ok {
+			// This can happen if the workload is deleted after we get the pods.
+			// We can just ignore it.
+			continue
+		}
+
+		// Get the pod group
+		if _, ok := podGroupCache[podGroupName]; !ok {
+			// This can happen if the pod group is removed from the workload.
+			// We can just ignore it.
+			continue
+		}
+
+		// Add to group health
+		if isPodHealthy(pod, disruptedPods, currentTime) {
+			podGroupHealthyPods[podGroupName]++
+		}
+		// Note: if there is a pod in the group which is not selected by the PDB, it will not be seen
+	}
+	// Evaluate health of all pod group replicas.
+	// A PodGroup replica is considered healthy if its number of healthy,
+	// non-evicting pods is greater than or equal to its policy.gang.minCount.
+	for podGroupName, healthyPods := range podGroupHealthyPods {
+		podGroup := podGroupCache[podGroupName]
+		if podGroup.Policy.Gang != nil {
+			if healthyPods >= podGroup.Policy.Gang.MinCount {
+				currentHealthy++
+			}
+		} else if podGroup.Policy.Basic != nil {
+			currentHealthy++
+			klog.Warningf("Pod group %v without Policy.Gang.MinCount are treated as healthy by default. To enforce a PodDisruptionBudget, use a Gang Scheduling policy.", podGroupName)
+		}
+
+	}
+	return
+}
+
 func countHealthyPods(pods []*v1.Pod, disruptedPods map[string]metav1.Time, currentTime time.Time) (currentHealthy int32) {
 	for _, pod := range pods {
-		// Pod is being deleted.
-		if pod.DeletionTimestamp != nil {
-			continue
-		}
-		// Pod is expected to be deleted soon.
-		if disruptionTime, found := disruptedPods[pod.Name]; found && disruptionTime.Time.Add(DeletionTimeout).After(currentTime) {
-			continue
-		}
-		if apipod.IsPodReady(pod) {
+		if isPodHealthy(pod, disruptedPods, currentTime) {
 			currentHealthy++
 		}
 	}
 
 	return
+}
+
+func isPodHealthy(pod *v1.Pod, disruptedPods map[string]metav1.Time, currentTime time.Time) bool {
+	// Pod is being deleted.
+	if pod.DeletionTimestamp != nil {
+		return false
+	}
+	// Pod is expected to be deleted soon.
+	if disruptionTime, found := disruptedPods[pod.Name]; found && disruptionTime.Time.Add(DeletionTimeout).After(currentTime) {
+		return false
+	}
+	return apipod.IsPodReady(pod)
 }
 
 // Builds new PodDisruption map, possibly removing items that refer to non-existing, already deleted

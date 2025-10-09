@@ -21,6 +21,7 @@ package app
 
 import (
 	"context"
+
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/scale"
 	"k8s.io/kubernetes/cmd/kube-controller-manager/names"
@@ -60,6 +61,7 @@ func newDisruptionController(ctx context.Context, controllerContext ControllerCo
 		controllerContext.InformerFactory.Apps().V1().ReplicaSets(),
 		controllerContext.InformerFactory.Apps().V1().Deployments(),
 		controllerContext.InformerFactory.Apps().V1().StatefulSets(),
+		controllerContext.InformerFactory.Scheduling().V1alpha1().Workloads(),
 		client,
 		controllerContext.RESTMapper,
 		scaleClient,

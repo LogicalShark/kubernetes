@@ -31,6 +31,7 @@ import (
 	autoscalingapi "k8s.io/api/autoscaling/v1"
 	v1 "k8s.io/api/core/v1"
 	policy "k8s.io/api/policy/v1"
+	"k8s.io/api/scheduling/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/meta/testrestmapper"
@@ -73,7 +74,7 @@ func (ps *pdbStates) Get(key string) policy.PodDisruptionBudget {
 	return (*ps)[key]
 }
 
-func (ps *pdbStates) VerifyPdbStatus(t *testing.T, key string, disruptionsAllowed, currentHealthy, desiredHealthy, expectedPods int32, disruptedPodMap map[string]metav1.Time) {
+func (ps *pdbStates) VerifyPdbStatus(t *testing.T, key string, disruptionsAllowed, currentHealthy, desiredHealthy, expectedReplicas int32, disruptedPodMap map[string]metav1.Time) {
 	t.Helper()
 	actualPDB := ps.Get(key)
 	actualConditions := actualPDB.Status.Conditions
@@ -82,7 +83,7 @@ func (ps *pdbStates) VerifyPdbStatus(t *testing.T, key string, disruptionsAllowe
 		DisruptionsAllowed: disruptionsAllowed,
 		CurrentHealthy:     currentHealthy,
 		DesiredHealthy:     desiredHealthy,
-		ExpectedPods:       expectedPods,
+		ExpectedPods:       expectedReplicas,
 		DisruptedPods:      disruptedPodMap,
 		ObservedGeneration: actualPDB.Generation,
 	}
@@ -128,12 +129,13 @@ func (ps *pdbStates) VerifyNoStatusError(t *testing.T, key string) {
 type disruptionController struct {
 	*DisruptionController
 
-	podStore cache.Store
-	pdbStore cache.Store
-	rcStore  cache.Store
-	rsStore  cache.Store
-	dStore   cache.Store
-	ssStore  cache.Store
+	podStore      cache.Store
+	pdbStore      cache.Store
+	rcStore       cache.Store
+	rsStore       cache.Store
+	dStore        cache.Store
+	ssStore       cache.Store
+	workloadStore cache.Store
 
 	coreClient      *fake.Clientset
 	scaleClient     *scalefake.FakeScaleClient
@@ -173,6 +175,7 @@ func newFakeDisruptionControllerWithTime(ctx context.Context, now time.Time) (*d
 		informerFactory.Apps().V1().ReplicaSets(),
 		informerFactory.Apps().V1().Deployments(),
 		informerFactory.Apps().V1().StatefulSets(),
+		informerFactory.Scheduling().V1alpha1().Workloads(),
 		coreClient,
 		testrestmapper.TestOnlyStaticRESTMapper(scheme),
 		fakeScaleClient,
@@ -199,6 +202,7 @@ func newFakeDisruptionControllerWithTime(ctx context.Context, now time.Time) (*d
 		informerFactory.Apps().V1().ReplicaSets().Informer().GetStore(),
 		informerFactory.Apps().V1().Deployments().Informer().GetStore(),
 		informerFactory.Apps().V1().StatefulSets().Informer().GetStore(),
+		informerFactory.Scheduling().V1alpha1().Workloads().Informer().GetStore(),
 		coreClient,
 		fakeScaleClient,
 		fakeDiscovery,
@@ -407,6 +411,38 @@ func newStatefulSet(t *testing.T, size int32) (*apps.StatefulSet, string) {
 	}
 
 	return ss, ssName
+}
+
+func newWorkload(t *testing.T, name string, podGroups []v1alpha1.PodGroup) (*v1alpha1.Workload, string) {
+	workload := &v1alpha1.Workload{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1alpha1"},
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       uuid.NewUUID(),
+			Name:      name,
+			Namespace: metav1.NamespaceDefault,
+		},
+		Spec: v1alpha1.WorkloadSpec{
+			PodGroups: podGroups,
+		},
+	}
+
+	workloadName, err := controller.KeyFunc(workload)
+	if err != nil {
+		t.Fatalf("Unexpected error naming Workload %q: %v", workload.Name, err)
+	}
+
+	return workload, workloadName
+}
+
+func newPodGroup(name string, minCount int32) v1alpha1.PodGroup {
+	return v1alpha1.PodGroup{
+		Name: name,
+		Policy: v1alpha1.PodGroupPolicy{
+			Gang: &v1alpha1.GangSchedulingPolicy{
+				MinCount: minCount,
+			},
+		},
+	}
 }
 
 func update(t *testing.T, store cache.Store, obj interface{}) {
@@ -625,7 +661,7 @@ func TestTotalUnmanagedPods(t *testing.T) {
 	dc.sync(ctx, pdbName)
 	var pods []*v1.Pod
 	pods = append(pods, pod)
-	_, unmanagedPods, _ := dc.getExpectedScale(ctx, pods)
+	_, unmanagedPods, _ := dc.getExpectedScale(ctx, pdb, pods)
 	if len(unmanagedPods) != 1 {
 		t.Fatalf("expected one pod to be unmanaged pod but found %d", len(unmanagedPods))
 	}
@@ -1615,4 +1651,171 @@ func verifyEventEmitted(t *testing.T, dc *disruptionController, expectedEvent st
 			t.Fatalf("Timed out: expected event not generated: %v", expectedEvent)
 		}
 	}
+}
+
+func TestUsePodGroups(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	dc, ps := newFakeDisruptionController(ctx)
+
+	ns := "test-use-pod-groups"
+
+	pdb, _ := newMinAvailablePodDisruptionBudget(t, intstr.FromInt32(2))
+	pdb.Name = "pdb-use-pod-groups"
+	pdb.Namespace = ns
+	pdbName, err := controller.KeyFunc(pdb)
+	if err != nil {
+		t.Fatalf("Unexpected error naming pdb %q: %v", pdb.Name, err)
+	}
+	pdb.Spec.Selector = newSel(map[string]string{"test": "TestUsePodGroups"})
+	*pdb.Spec.AvailabilityMode = policy.WorkloadAvailability
+	add(t, dc.pdbStore, pdb)
+
+	workload, _ := newWorkload(t, "workload1", []v1alpha1.PodGroup{
+		newPodGroup("pg1", 2),
+		newPodGroup("pg2", 2),
+	})
+	workload.Namespace = ns
+	add(t, dc.workloadStore, workload)
+
+	// Create pods for pod group 1
+	for i := range 2 {
+		pod, _ := newPod(t, fmt.Sprintf("pg1-pod%d", i))
+		pod.Namespace = ns
+		pod.Labels = map[string]string{"test": "TestUsePodGroups"}
+		pod.Spec.WorkloadRef = &v1.WorkloadReference{
+			Name:     "workload1",
+			PodGroup: "pg1",
+		}
+		add(t, dc.podStore, pod)
+	}
+
+	// Create pods for pod group 2
+	for i := range 3 {
+		pod, _ := newPod(t, fmt.Sprintf("pg2-pod%d", i))
+		pod.Namespace = ns
+		pod.Labels = map[string]string{"test": "TestUsePodGroups"}
+		pod.Spec.WorkloadRef = &v1.WorkloadReference{
+			Name:     "workload1",
+			PodGroup: "pg2",
+		}
+		add(t, dc.podStore, pod)
+	}
+
+	dc.sync(ctx, pdbName)
+	// 2 pod groups are healthy, so disruptions allowed is 2-2=0.
+	ps.VerifyPdbStatus(t, pdbName, 0, 2, 2, 2, map[string]metav1.Time{})
+
+	// Make one pod from pg2 unhealthy.
+	podKey := fmt.Sprintf("%s/pg2-pod0", ns)
+	pod, _, err := dc.podStore.GetByKey(podKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unhealthyPod := pod.(*v1.Pod).DeepCopy()
+	unhealthyPod.Status.Conditions = []v1.PodCondition{}
+	update(t, dc.podStore, unhealthyPod)
+
+	dc.sync(ctx, pdbName)
+	// pg1 is healthy (2>=2), and pg2 is healthy (2>=2).
+	// So 2 pod groups are healthy.
+	ps.VerifyPdbStatus(t, pdbName, 0, 2, 2, 2, map[string]metav1.Time{})
+
+	// Make another pod from pg2 unhealthy, making the pod group unhealthy.
+	podKey = fmt.Sprintf("%s/pg2-pod1", ns)
+	pod, _, err = dc.podStore.GetByKey(podKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unhealthyPod = pod.(*v1.Pod).DeepCopy()
+	unhealthyPod.Status.Conditions = []v1.PodCondition{}
+	update(t, dc.podStore, unhealthyPod)
+
+	dc.sync(ctx, pdbName)
+	// pg1 is healthy (2>=2), but pg2 is unhealthy (1<2).
+	// So only 1 pod group is healthy.
+	ps.VerifyPdbStatus(t, pdbName, 0, 1, 2, 2, map[string]metav1.Time{})
+}
+
+func TestUsePodGroupsWithMaxUnavailable(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	dc, ps := newFakeDisruptionController(ctx)
+
+	ns := "test-use-pod-groups-max-unavailable"
+
+	pdb, _ := newMaxUnavailablePodDisruptionBudget(t, intstr.FromInt32(1))
+	pdb.Name = "pdb-use-pod-groups-max-unavailable"
+	pdb.Namespace = ns
+	pdbName, err := controller.KeyFunc(pdb)
+	if err != nil {
+		t.Fatalf("Unexpected error naming pdb %q: %v", pdb.Name, err)
+	}
+	pdb.Spec.Selector = newSel(map[string]string{"test": "TestUsePodGroupsMaxUnavailable"})
+	*pdb.Spec.AvailabilityMode = policy.WorkloadAvailability
+	add(t, dc.pdbStore, pdb)
+
+	workload, _ := newWorkload(t, "workload1", []v1alpha1.PodGroup{
+		newPodGroup("pg1", 2),
+		newPodGroup("pg2", 2),
+	})
+	workload.Namespace = ns
+	add(t, dc.workloadStore, workload)
+
+	// Create 2 pods for pod group 1
+	for i := range 2 {
+		pod, _ := newPod(t, fmt.Sprintf("pg1-pod%d", i))
+		pod.Namespace = ns
+		pod.Labels = map[string]string{"test": "TestUsePodGroupsMaxUnavailable"}
+		pod.Spec.WorkloadRef = &v1.WorkloadReference{
+			Name:     "workload1",
+			PodGroup: "pg1",
+		}
+		add(t, dc.podStore, pod)
+	}
+
+	// Create pods for pod group 2
+	for i := range 3 {
+		pod, _ := newPod(t, fmt.Sprintf("pg2-pod%d", i))
+		pod.Namespace = ns
+		pod.Labels = map[string]string{"test": "TestUsePodGroupsMaxUnavailable"}
+		pod.Spec.WorkloadRef = &v1.WorkloadReference{
+			Name:     "workload1",
+			PodGroup: "pg2",
+		}
+		add(t, dc.podStore, pod)
+	}
+
+	dc.sync(ctx, pdbName)
+	// 2 pod groups are healthy, so disruptions allowed is 1.
+	// DesiredHealthy is 2-1=1.
+	ps.VerifyPdbStatus(t, pdbName, 1, 2, 1, 2, map[string]metav1.Time{})
+
+	// Make one pod from pg2 unhealthy.
+	podKey := fmt.Sprintf("%s/pg2-pod0", ns)
+	pod, _, err := dc.podStore.GetByKey(podKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unhealthyPod := pod.(*v1.Pod).DeepCopy()
+	unhealthyPod.Status.Conditions = []v1.PodCondition{}
+	update(t, dc.podStore, unhealthyPod)
+
+	dc.sync(ctx, pdbName)
+	// pg1 is healthy (2>=2), and pg2 is healthy (2>=2).
+	// So 2 pod groups are healthy. Disruptions allowed is 1.
+	ps.VerifyPdbStatus(t, pdbName, 1, 2, 1, 2, map[string]metav1.Time{})
+
+	// Make another pod from pg2 unhealthy, making the pod group unhealthy.
+	podKey = fmt.Sprintf("%s/pg2-pod1", ns)
+	pod, _, err = dc.podStore.GetByKey(podKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unhealthyPod = pod.(*v1.Pod).DeepCopy()
+	unhealthyPod.Status.Conditions = []v1.PodCondition{}
+	update(t, dc.podStore, unhealthyPod)
+
+	dc.sync(ctx, pdbName)
+	// pg1 is healthy (2>=2), but pg2 is unhealthy (1<2).
+	// So only 1 pod group is healthy. Disruptions allowed is 0.
+	ps.VerifyPdbStatus(t, pdbName, 0, 1, 1, 2, map[string]metav1.Time{})
 }

@@ -142,6 +142,11 @@ func (in *PodDisruptionBudgetSpec) DeepCopyInto(out *PodDisruptionBudgetSpec) {
 		*out = new(UnhealthyPodEvictionPolicyType)
 		**out = **in
 	}
+	if in.AvailabilityMode != nil {
+		in, out := &in.AvailabilityMode, &out.AvailabilityMode
+		*out = new(AvailabilityMode)
+		**out = **in
+	}
 	return
 }
 
